@@ -14,6 +14,7 @@
 #include <Headers/kern_devinfo.hpp>
 #include <Headers/kern_cpu.hpp>
 #include <Library/LegacyIOService.h>
+#include <IOKit/IOLocks.h>
 
 class IGFX {
 public:
@@ -46,6 +47,7 @@ private:
 	 *  Framebuffer patch flags
 	 */
 	union FramebufferPatchFlags {
+		// Sandy+ bits
 		struct FramebufferPatchFlagBits {
 			uint8_t FPFFramebufferId            :1;
 			uint8_t FPFModelNameAddr            :1;
@@ -70,6 +72,22 @@ private:
 			uint8_t FPFSliceCount               :1;
 			uint8_t FPFEuCount                  :1;
 		} bits;
+		
+		// Westmere bits
+		struct FramebufferWestmerePatchFlagBits {
+			uint8_t LinkWidth                               : 1;
+			uint8_t SingleLink                              : 1;
+			uint8_t FBCControlCompression                   : 1;
+			uint8_t FeatureControlFBC                       : 1;
+			uint8_t FeatureControlGPUInterruptHandling      : 1;
+			uint8_t FeatureControlGamma                     : 1;
+			uint8_t FeatureControlMaximumSelfRefreshLevel   : 1;
+			uint8_t FeatureControlPowerStates               : 1;
+			uint8_t FeatureControlRSTimerTest               : 1;
+			uint8_t FeatureControlRenderStandby             : 1;
+			uint8_t FeatureControlWatermarks                : 1;
+		} bitsWestmere;
+		
 		uint32_t value;
 	};
 
@@ -154,6 +172,29 @@ private:
 	 *  Framebuffer find / replace patches
 	 */
 	FramebufferPatch framebufferPatches[MaxFramebufferPatchCount] {};
+	
+	/**
+	 *  Framebuffer patches for first generation (Westmere).
+	 */
+	struct FramebufferWestmerePatches {
+		uint32_t LinkWidth {1};
+		uint32_t SingleLink {0};
+		
+		uint32_t FBCControlCompression {0};
+		uint32_t FeatureControlFBC {0};
+		uint32_t FeatureControlGPUInterruptHandling {0};
+		uint32_t FeatureControlGamma {0};
+		uint32_t FeatureControlMaximumSelfRefreshLevel {0};
+		uint32_t FeatureControlPowerStates {0};
+		uint32_t FeatureControlRSTimerTest {0};
+		uint32_t FeatureControlRenderStandby {0};
+		uint32_t FeatureControlWatermarks {0};
+	};
+	
+	/**
+	 *  Framebuffer patches for first generation (Westmere).
+	 */
+	FramebufferWestmerePatches framebufferWestmerePatches;
 
 	/**
 	 *  Framebuffer list, imported from the framebuffer kext
@@ -340,6 +381,11 @@ private:
 	bool forceOpenGL {false};
 
 	/**
+	 *  Set to true to enable Metal support for offline rendering
+	 */
+	bool forceMetal {false};
+
+	/**
 	 *  Set to true if Sandy Bridge Gen6Accelerator should be renamed
 	 */
 	bool moderniseAccelerator {false};
@@ -398,6 +444,37 @@ private:
 			return false;
 		}
 	};
+	
+	// NOTE: the MMIO space is also available at RC6_RegBase
+	uint32_t (*AppleIntelFramebufferController__ReadRegister32)(void*,uint32_t) {};
+	void (*AppleIntelFramebufferController__WriteRegister32)(void*,uint32_t,uint32_t) {};
+
+	class AppleIntelFramebufferController;
+	// Populated at AppleIntelFramebufferController::start
+	// Useful for getting access to Read/WriteRegister, rather than having
+	// to compute the offsets
+	AppleIntelFramebufferController** gFramebufferController {};
+
+	struct RPSControl {
+		bool enabled {false};
+		uint32_t freq_max {0};
+		
+		void initFB(IGFX&,KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+		void initGraphics(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+
+		static int pmNotifyWrapper(unsigned int,unsigned int,unsigned long long *,unsigned int *);
+		mach_vm_address_t orgPmNotifyWrapper;
+	} RPSControl;
+	
+	struct ForceWakeWorkaround {
+		bool enabled {false};
+
+		void initGraphics(IGFX&,KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+		
+		static bool pollRegister(uint32_t, uint32_t, uint32_t, uint32_t);
+		static bool forceWakeWaitAckFallback(uint32_t, uint32_t, uint32_t);
+		static void forceWake(void*, uint8_t set, uint32_t dom, uint32_t);
+	} ForceWakeWorkaround;
 
 	/**
 	 * Ensure each modeset is a complete modeset.
@@ -408,7 +485,17 @@ private:
 	 * Ensure each display is online.
 	 */
 	FramebufferModifer forceOnlineDisplay;
+	
+	/**
+	 * Prevent IntelAccelerator from starting.
+	 */
+	bool disableAccel {false};
 
+	/**
+	 * Disable Type C framebuffer check.
+	 */
+	bool disableTypeCCheck {false};
+	
 	/**
 	 *  Perform platform table dump to ioreg
 	 */
@@ -494,12 +581,12 @@ private:
 	 *  Driver-requested backlight frequency obtained from BXT_BLC_PWM_FREQ1 write attempt at system start.
 	 */
 	uint32_t driverBacklightFrequency {};
-	
+
 	/**
 	 *  The default DPCD address
 	 */
 	static constexpr uint32_t DPCD_DEFAULT_ADDRESS = 0x0000;
-	
+
 	/**
 	 *  The extended DPCD address
 	 */
@@ -1312,7 +1399,7 @@ private:
 	/**
 	 *  AppleIntelFramebufferController::getOSInformation wrapper to patch framebuffer data
 	 */
-	static bool wrapGetOSInformation(void *that);
+	static bool wrapGetOSInformation(IOService *that);
 
 	/**
 	 *  IGHardwareGuC::loadGuCBinary wrapper to feed updated (compatible GuC)
@@ -1366,6 +1453,8 @@ private:
 	 *  AppleIntelFramebuffer::getDisplayStatus to force display status on configured screens.
 	 */
 	static uint32_t wrapGetDisplayStatus(IOService *framebuffer, void *displayPath);
+	
+	static uint64_t wrapIsTypeCOnlySystem(void*);
 
 	/**
 	 *  Load GuC-specific patches and hooks
@@ -1436,6 +1525,17 @@ private:
 	 *  @return true if patched anything
 	 */
 	bool applyPatch(const KernelPatcher::LookupPatch &patch, uint8_t *startingAddress, size_t maxSize);
+	
+	/**
+	 *  Add int to dictionary.
+	 *
+	 *  @param dict		OSDictionary instance.
+	 *  @param key		Key to add.
+	 *  @param value 	Value to add.
+	 *
+	 *  @return true if added
+	 */
+	bool setDictUInt32(OSDictionary *dict, const char *key, UInt32 value);
 
 	/**
 	 *  Patch platformInformationList
@@ -1477,6 +1577,16 @@ private:
 	 *  Apply DP to HDMI automatic connector type changes
 	 */
 	void applyHdmiAutopatch();
+	
+	/**
+	 *	Apply patches for first generation framebuffer.
+	 */
+	void applyWestmerePatches(KernelPatcher &patcher);
+	
+	/**
+	 *	Apply I/O registry FeatureControl and FBCControl patches for first generation framebuffer.
+	 */
+	void applyWestmereFeaturePatches(IOService *framebuffer);
 };
 
 #endif /* kern_igfx_hpp */
